@@ -1,0 +1,33 @@
+---
+base_dir: data/checkpoint/hz
+log_level: INFO
+data:
+  batch_size: 32
+  test_batch_size: 32
+  final_dataset_dir: /data3/chenbinglin/workspace/metro_od/my_dataset/uncompress/input_seq_4/hangzhou
+  graph_pkl_filename: /data3/chenbinglin/workspace/metro_od/my_dataset/graph_hz_conn.pkl
+
+model:
+  input_seq: 4
+  input_dim: 80
+  hidden_dim: 16
+  num_nodes: 80
+  layer_nums: 2
+  dropout: 0.1
+
+train:
+  base_lr: 0.001
+  epoch: 0
+  epochs: 21
+  epsilon: 1.0e-4
+  global_step: 0
+  lr_decay_ratio: 0.8
+  max_grad_norm: 10
+  min_learning_rate: 1.0e-16
+  optimizer: adam
+  patience: 100
+  steps: [60, 70, 80, 90, 100]
+  test_every_n_epochs: 1
+  save_every_n_epochs: 1
+  lr_patience: 20
+  lr_factor: 0.5

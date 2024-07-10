@@ -1,0 +1,33 @@
+---
+base_dir: data/checkpoint/sh
+log_level: INFO
+data:
+  batch_size: 8
+  test_batch_size: 8
+  final_dataset_dir: /data3/chenbinglin/workspace/metro_od/my_dataset/uncompress/input_seq_4/shanghai
+  graph_pkl_filename: /data3/chenbinglin/workspace/metro_od/my_dataset/graph_sh_conn.pkl
+
+model:
+  input_seq: 4
+  input_dim: 288
+  hidden_dim: 16
+  num_nodes: 288
+  layer_nums: 5
+  dropout: 0.1
+
+train:
+  base_lr: 0.001
+  epoch: 0
+  epochs: 11
+  epsilon: 1.0e-4
+  global_step: 0
+  lr_decay_ratio: 0.5
+  max_grad_norm: 5
+  min_learning_rate: 1.0e-16
+  optimizer: adam
+  patience: 100
+  steps: [60, 80, 100, 120, 140, 160, 180, 200, 220, 240, 260, 280]
+  test_every_n_epochs: 1
+  save_every_n_epochs: 1
+  lr_patience: 10
+  lr_factor: 0.5
