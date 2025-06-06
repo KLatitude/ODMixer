@@ -9,29 +9,19 @@ import time
 import torch
 from torch import nn
 from torch import optim
-from torch.optim.lr_scheduler import MultiStepLR
 from torch.nn.init import xavier_uniform_
-from torch.nn.utils import clip_grad_norm_
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from torch.optim.optimizer import Optimizer
-import torch.nn.functional as F
-from models.net import Net
-from models.MaskNet import MaskNet
-from models.LinearNet import LinearNet
+from models.odmixer import ODMixer
 
 from lib import utils_data as utils
 from lib import metrics
-import wandb
-from lib import data_load 
 
 try:
     from yaml import CLoader as Loader, CDumper as Dumper
 except ImportError:
     from yaml import Loader, Dumper
-from torch.optim.lr_scheduler import  _LRScheduler
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3, 4, 5, 6, 7'
+os.environ['CUDA_VISIBLE_DEVICES'] = '4'
 os.environ['WANDB_MODE'] = 'offline'
 
 seed = 3407
@@ -65,7 +55,7 @@ def _get_log_dir(kwargs, status=''):
         base_dir = kwargs.get('base_dir')
         log_dir = os.path.join(base_dir, status + run_id)
     if not os.path.exists(log_dir):
-        os.mkdir(log_dir)
+        os.makedirs(log_dir)
     return log_dir
 
 
@@ -78,19 +68,19 @@ def init_weights(m):
 def evaluate(model, dataset, dataset_type, cfg, logger, log_dir, device):
     logger.info('{} begin'.format(dataset_type))
 
-    # data_loader = dataset[dataset_type + '_loader'].get_iterator()
     data_loader = dataset[dataset_type + '_loader']
     model.eval()
     y_od = []
 
     begin_time = time.perf_counter()
     for _, sequence in enumerate(data_loader):
-        # sequence.to(device)
         for key, element in sequence.items():
             sequence[key] = element.float().to(device)
+        
         with torch.no_grad():
             prediction_od, _a = model(sequence)
             y_od.append(prediction_od.detach().cpu().numpy())
+            # y_do.append(prediction_do.detach().cpu().numpy())
     end_time = time.perf_counter()
     logger.info('Infer Time: {}'.format(end_time - begin_time))
 
@@ -98,15 +88,35 @@ def evaluate(model, dataset, dataset_type, cfg, logger, log_dir, device):
     gt = dataset[dataset_type]['y_od']
     y_od = np.concatenate(y_od, axis=0)
 
-    logger.info('size: {}'.format(len(y_od)))
-    # logger.info('gt shape: {}'.format(gt.shape))
-    gt = scaler_od.inverse_transform(gt[:, :, :, :])
-    y_od = scaler_od.inverse_transform(y_od[:gt.shape[0], :, :, :])
+    mae_list = []
+    mape_net_list = []
+    rmse_list = []
+    mae_sum = 0
+    mape_net_sum = 0
+    rmse_sum = 0
+    horizon = cfg['model']['horizon']
+    for horizon_i in range(horizon):
+        y_truth = scaler_od.inverse_transform(
+            gt[:, horizon_i, :, :])
 
-    y_od[y_od < 0] = 0
-    mae = metrics.mae_np(y_od, gt)
-    mape = metrics.mape_np(y_od, gt)
-    rmse = metrics.rmse_np(y_od, gt)
+        y_pred = scaler_od.inverse_transform(
+            y_od[:y_truth.shape[0], horizon_i, :, :])
+        y_pred[y_pred < 0] = 0
+        mae = metrics.mae_np(y_pred, y_truth)
+        mape_net = metrics.mape_np(y_pred, y_truth)
+        rmse = metrics.rmse_np(y_pred, y_truth)
+        mae_sum += mae
+        mape_net_sum += mape_net
+        rmse_sum += rmse
+        mae_list.append(mae)
+        mape_net_list.append(mape_net)
+        rmse_list.append(rmse)
+
+        msg = "Horizon {:02d}, MAE: {:.3f}, RMSE: {:.3f}, MAPE_net: {:.5f}"
+        logger.info(msg.format(horizon_i + 1, mae, rmse, mape_net))
+    mae = mae_sum / horizon
+    rmse = rmse_sum / horizon
+    mape = mape_net_sum / horizon
 
     logger.info('MAE: {:.3f} RMSE: {:.3f} MAPE: {:.5f}'.format(mae, rmse, mape))
     logger.info('{} end'.format(dataset_type))
@@ -115,51 +125,46 @@ def evaluate(model, dataset, dataset_type, cfg, logger, log_dir, device):
 
 
 def train(cfg, logger, device, log_dir):
-    writer = SummaryWriter('./runs/log')
-
-    # some parameters
-    max_grad_norm = cfg['train']['max_grad_norm']
-
-    # load graph adj matrix
-    graph_pkl_filename = cfg['data']['graph_pkl_filename']
-    adj_mx = utils.load_graph_data(graph_pkl_filename)
-    adj_mx = adj_mx / (adj_mx.sum(axis=1) + 1e-18)
-
     # load dataset
-    dataset = data_load.load_dataset(cfg['data']['final_dataset_dir'], cfg['data']['batch_size'],
+    dataset = utils.load_dataset(cfg['data']['dataset_dir'], cfg['data']['batch_size'],
                                  test_batch_size=cfg['data']['test_batch_size'], scaler_axis=(0, 1, 2, 3))
     for k, v in dataset['train'].items():
         if hasattr(v, 'shape'):
             logger.info((k, v.shape))
 
-    model = LinearNet(cfg, logger)
+    model = ODMixer(cfg, logger)
     model.apply(init_weights)
 
+    if 'pt_file' in cfg['data']:
+        checkpoint = torch.load(cfg['data']['pt_file'])
+        missing_keys, unexpected_keys = model.load_state_dict(checkpoint, strict=False)
+        for name, param in model.named_parameters():
+            if name in missing_keys:
+                print(f'未初始化: {name} | shape: {param.shape}')
     
+    total_params = 0
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad: continue
+        param = parameter.numel()
+        total_params += param
+    logger.info(f"Total Trainable Params: {total_params}")
+
     scaler_od = dataset['scaler_od']
     scaler_od_torch = utils.StandardScaler_Torch(scaler_od.mean, scaler_od.std, device)
     logger.info('scaler_od.mean: {}, scaler_od.std: {}'.format(scaler_od.mean, scaler_od.std))
 
     if torch.cuda.device_count() > 1:
-        print('Use {} gpus'.format(torch.cuda.device_count()))
+        logger.info('Use {} gpus'.format(torch.cuda.device_count()))
         model = nn.DataParallel(model)
     model.to(device)
 
-    adj_mx = torch.from_numpy(adj_mx).to(device)
-    adj_mx = adj_mx.unsqueeze(dim=0).repeat(torch.cuda.device_count(), 1, 1)
-    # 多GPU训练, 需要将adj_mx 转换为 [batch_size, num_nodes, num_nodes]
-
     criterion_l1 = nn.L1Loss(reduction='mean').to(device)
-    criterion_smooth_l1 = nn.SmoothL1Loss(reduction='mean', beta=5).to(device)
 
-    # criterion = NetLoss()
     lr = cfg['train']['base_lr']
     eps = cfg['train']['epsilon']
     optimizer = optim.Adam([
         {'params': filter(lambda p: p.requires_grad, model.parameters()), 'lr': lr, 'eps': eps},
     ])
-
-    
 
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
                                                      mode='min',
@@ -171,13 +176,12 @@ def train(cfg, logger, device, log_dir):
 
 
     update = {'val_steady_count': 0, 'last_val_mae': 1e6, 'last_val_mape': 1e6}
-    train_patience = 100
+    train_patience = cfg['train']['patience']
 
-    for epoch in tqdm(range(cfg['train']['epochs'])):
+    for epoch in range(cfg['train']['epochs']):
         total_loss = 0.0
         total_od_loss = 0.0
         total_prev_od_loss = 0.0
-        # dataset['train_loader'].shuffle()
         train_loader = dataset['train_loader']
         model.train()
         iter_cnt = 0
@@ -200,14 +204,10 @@ def train(cfg, logger, device, log_dir):
             prev_labels_od = scaler_od_torch.inverse_transform(sequence['prev_y_od'][:prev_prediction_od.shape[0], :, :, :])
             prev_od_loss = criterion_l1(prev_prediction_od, prev_labels_od)
             
-
             loss = od_loss + prev_od_loss
             total_loss += loss.item()
-            total_od_loss += od_loss.item()
-            # total_prev_od_loss += prev_od_loss.item()
 
             loss.backward()
-            # clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
 
             iter_cnt += 1
@@ -217,9 +217,9 @@ def train(cfg, logger, device, log_dir):
         logger.info('Epoch: {}, time: {}, total_loss: {}'.format(epoch, time_elapsed, total_loss / iter_cnt))
 
 
-        eval_data = evaluate(model, dataset, 'val', cfg, logger, log_dir, device, adj_mx)
+        eval_data = evaluate(model, dataset, 'val', cfg, logger, log_dir, device)
 
-        test_data = evaluate(model, dataset, 'test', cfg, logger, log_dir, device, adj_mx)
+        test_data = evaluate(model, dataset, 'test', cfg, logger, log_dir, device)
 
         for category in ['od']:
             change_flag = False
@@ -230,9 +230,6 @@ def train(cfg, logger, device, log_dir):
             if eval_data['mape'] < update['last_val_mape']:
                 update['last_val_mape'] = eval_data['mape']
                 change_flag = True
-            # if eval_data['rmse'] < update['last_val_rmse']:
-            #     update['last_val_rmse'] = eval_data['rmse']
-            #     change_flag = True
 
             if change_flag:
                 update['val_steady_count'] = 0
@@ -262,13 +259,10 @@ def train(cfg, logger, device, log_dir):
         scheduler.step(eval_data['mape'])
         
 
-    writer.close()
-
-
 def main(args):
     cfg = read_cfg_file(args.config_filename)
 
-    log_dir = _get_log_dir(cfg, 'final/')
+    log_dir = _get_log_dir(cfg)
     log_level = cfg.get('log_level', 'INFO')
 
     logger = utils.get_logger(log_dir, __name__, 'info.log', log_level)

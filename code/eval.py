@@ -7,26 +7,20 @@ import time
 
 import torch
 from torch import nn
-from torch import optim
-from torch.optim.lr_scheduler import MultiStepLR
 from torch.nn.init import xavier_uniform_
 from torch.nn.utils import clip_grad_norm_
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from torch.optim.optimizer import Optimizer
 
-from models.contra import ContraNet, ContrastiveLoss, Loss, SiamMAE
-from models.net import Net, GraphMAE
+from models.odmixer import ODMixer
 from lib import utils_data as utils
 from lib import metrics
-import wandb
 
 try:
     from yaml import CLoader as Loader, CDumper as Dumper
 except ImportError:
     from yaml import Loader, Dumper
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--config_filename',
@@ -56,26 +50,19 @@ def _get_log_dir(kwargs, status=''):
         os.mkdir(log_dir)
     return log_dir
 
-
-def init_weights(m):
-    classname = m.__class__.__name__
-    if type(classname) == nn.Linear:
-        xavier_uniform_(m.weight.data)
-
-
-def evaluate(model, dataset, dataset_type, cfg, logger, log_dir, device):
+def evaluate(model, dataset, dataset_type, cfg, logger, log_dir, device, scaler, gaussian_std=None):
     logger.info('{} begin'.format(dataset_type))
 
-    # data_loader = dataset[dataset_type + '_loader'].get_iterator()
     data_loader = dataset[dataset_type + '_loader']
     model.eval()
     y_od = []
+    y_do = []
 
     begin_time = time.perf_counter()
     for _, sequence in enumerate(data_loader):
-        # sequence.to(device)
         for key, element in sequence.items():
             sequence[key] = element.float().to(device)
+
         with torch.no_grad():
             prediction_od, _a = model(sequence)
             y_od.append(prediction_od.detach().cpu().numpy())
@@ -86,33 +73,58 @@ def evaluate(model, dataset, dataset_type, cfg, logger, log_dir, device):
     gt = dataset[dataset_type]['y_od']
     y_od = np.concatenate(y_od, axis=0)
 
-    logger.info('size: {}'.format(len(y_od)))
-    # logger.info('gt shape: {}'.format(gt.shape))
-    gt = scaler_od.inverse_transform(gt[:, :, :, :])
-    y_od = scaler_od.inverse_transform(y_od[:gt.shape[0], :, :, :])
+    print('Length: {}'.format(y_od.shape))
 
-    y_od[y_od < 0] = 0
-    mae = metrics.mae_np(y_od, gt)
-    mape = metrics.mape_np(y_od, gt)
-    rmse = metrics.rmse_np(y_od, gt)
+    mae_list = []
+    mape_net_list = []
+    rmse_list = []
+    mae_sum = 0
+    mape_net_sum = 0
+    rmse_sum = 0
+    horizon = cfg['model']['horizon']
+    for horizon_i in range(horizon):
+        y_truth = scaler_od.inverse_transform(
+            gt[:, horizon_i, :, :])
+
+        y_pred = scaler_od.inverse_transform(
+            y_od[:y_truth.shape[0], horizon_i, :, :])
+        y_pred[y_pred < 0] = 0
+
+        mae = metrics.mae_np(y_pred, y_truth)
+        mape_net = metrics.mape_np(y_pred, y_truth)
+        rmse = metrics.rmse_np(y_pred, y_truth)
+        mae_sum += mae
+        mape_net_sum += mape_net
+        rmse_sum += rmse
+        mae_list.append(mae)
+        mape_net_list.append(mape_net)
+        rmse_list.append(rmse)
+
+        msg = "Horizon {:02d}, MAE: {:.4f}, RMSE: {:.4f}, MAPE_net: {:.6f}"
+        logger.info(msg.format(horizon_i + 1, mae, rmse, mape_net))
+
+    mae = mae_sum / horizon
+    rmse = rmse_sum / horizon
+    mape = mape_net_sum / horizon
 
     logger.info('MAE: {:.3f} RMSE: {:.3f} MAPE: {:.5f}'.format(mae, rmse, mape))
     logger.info('{} end'.format(dataset_type))
 
+    
     return {'mae': mae, 'mape': mape, 'rmse': rmse}
 
 
 def eval(cfg, logger, device, log_dir): 
-
     # load dataset
     dataset = utils.load_dataset(cfg['data']['final_dataset_dir'], cfg['data']['batch_size'],
                                     test_batch_size=cfg['data']['test_batch_size'], scaler_axis=(0, 1, 2, 3))
-    for k, v in dataset['train'].items():
+    for k, v in dataset['test'].items():
         if hasattr(v, 'shape'):
             logger.info((k, v.shape))
 
-    model = Net(cfg, logger)
-    pt_file = ''
+    model = ODMixer(cfg, logger)
+    pt_file = cfg['data']['pt_file']
+
     # single-gpu save, single-gpu load
     model.load_state_dict(torch.load(pt_file))
     
@@ -129,14 +141,13 @@ def eval(cfg, logger, device, log_dir):
         model = nn.DataParallel(model)
     model.to(device)
 
-    test_data = evaluate(model, dataset, 'test', cfg, logger, log_dir, device)
+    evaluate(model, dataset, 'test', cfg, logger, log_dir, device, scaler_od_torch)
 
 
 def main(args):
     cfg = read_cfg_file(args.config_filename)
 
-    # log_dir = _get_log_dir(cfg, 'contra/')
-    log_dir = _get_log_dir(cfg, 'final/')
+    log_dir = _get_log_dir(cfg)
     log_level = cfg.get('log_level', 'INFO')
 
     logger = utils.get_logger(log_dir, __name__, 'info.log', log_level)
@@ -144,7 +155,6 @@ def main(args):
     logger.info(log_dir)
     logger.info(cfg)
 
-    # contra_train(cfg, logger, device, log_dir)
     eval(cfg, logger, device, log_dir)
 
 
